@@ -1,162 +1,195 @@
 # Multi-Container Runtime
 
-## 1. Objective
-This project implements a lightweight container runtime to demonstrate key Operating System concepts such as process isolation, scheduling, inter-process communication (IPC), and memory management.
+## 1. Team Information
+- Name: Dhanush K (SRN: PES1UG24CS661)
+- Name: Sanjeev Murthy .B (SRN: PES1UG24CS612)
 
 ---
 
-## 2. Platform
-- Ubuntu 22.04 / 24.04 (VM recommended)
-- Secure Boot OFF
+## 2. Build, Load, and Run Instructions
 
----
+### Prerequisites
+Ubuntu 22.04 or 24.04 VM with Secure Boot OFF.
 
-## 3. Build and Setup
-
-### Install Dependencies
-sudo apt update  
+```bash
+sudo apt update
 sudo apt install -y build-essential linux-headers-$(uname -r)
-
----
-
-### Build Project
-cd boilerplate  
-make clean  
-make  
-
-This builds:
-- engine (runtime)
-- cpu_hog, memory_hog (workloads)
-- monitor.ko (kernel module)
-
----
+```
 
 ### Prepare Root Filesystem
-rm -rf rootfs-base rootfs-alpha rootfs-beta  
+```bash
+mkdir rootfs-base
+wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+cp -a ./rootfs-base ./rootfs-alpha
+cp -a ./rootfs-base ./rootfs-beta
+```
 
-mkdir rootfs-base  
+### Build
+```bash
+cd boilerplate
+make
+```
 
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base  
-
-cp -a rootfs-base rootfs-alpha  
-cp -a rootfs-base rootfs-beta  
-
----
-
-### Copy Workloads
-cp cpu_hog rootfs-alpha/  
-cp memory_hog rootfs-alpha/  
-
-cp cpu_hog rootfs-beta/  
-cp memory_hog rootfs-beta/  
-
----
+### Copy Workloads into Rootfs
+```bash
+cp boilerplate/memory_hog rootfs-alpha/
+cp boilerplate/cpu_hog rootfs-alpha/
+cp boilerplate/io_pulse rootfs-alpha/
+cp boilerplate/memory_hog rootfs-beta/
+cp boilerplate/cpu_hog rootfs-beta/
+cp boilerplate/io_pulse rootfs-beta/
+```
 
 ### Load Kernel Module
-sudo rmmod monitor 2>/dev/null  
-sudo insmod monitor.ko  
-lsmod | grep monitor  
+```bash
+cd boilerplate
+sudo insmod monitor.ko
+ls -l /dev/container_monitor
+```
+
+### Start Supervisor (Terminal 1 — leave running)
+```bash
+sudo ./engine supervisor ./rootfs-base
+```
+
+### Launch Containers (Terminal 2)
+```bash
+sudo ./engine start alpha ../rootfs-alpha "/cpu_hog 60"
+sudo ./engine start beta ../rootfs-beta "/cpu_hog 60"
+sudo ./engine ps
+sudo ./engine logs alpha
+sudo ./engine stop alpha
+```
+
+### Memory Limit Test
+```bash
+sudo ./engine start memtest ../rootfs-alpha "/memory_hog 2 500"
+sleep 20
+sudo dmesg | grep container_monitor | tail -20
+sudo ./engine ps
+```
+
+### Scheduling Experiment
+```bash
+# Terminal 2
+time sudo ./engine run hogA ../rootfs-alpha "/cpu_hog 30"
+
+# Terminal 3 simultaneously
+time sudo ./engine run hogB ../rootfs-beta "/cpu_hog 30" --nice 19
+```
+
+### Cleanup
+```bash
+# Press Ctrl+C in Terminal 1 to stop supervisor
+sudo rmmod monitor
+sudo dmesg | tail -5
+```
 
 ---
 
-## 4. Running the System
+## 3. Demo Overview
 
-### Terminal 1
-sudo ./engine supervisor ./rootfs-base  
+### Multi-Container Supervision and Metadata Tracking
+Two containers (alpha, beta) started and running under one supervisor.
+The `ps` command shows ID, PID, STATE, SOFT and HARD memory limits for each running container.
 
----
+### Bounded-Buffer Logging
+Container stdout is captured through the producer-consumer pipeline into log files.
+The `cpu_hog` output is captured line by line from the container pipe into the bounded buffer and written to the log file.
 
-### Terminal 2
-sudo ./engine start alpha ./rootfs-alpha "/cpu_hog 60"  
-sudo ./engine start beta ./rootfs-beta "/cpu_hog 60"  
+### CLI and IPC
+CLI commands are issued to the supervisor over the UNIX domain socket.
+Container metadata is tracked correctly after lifecycle events such as start, stop, and kill.
 
-sudo ./engine ps  
+### Soft-Limit Warning and Hard-Limit Enforcement
+The kernel module detects the `memtest` container RSS exceeding the soft limit (40 MiB) and logs a warning via `dmesg`.
+It then kills the container when RSS exceeds the hard limit (64 MiB).
+Container metadata is updated to the `killed` state accordingly.
 
----
+### Scheduling Experiment
+`hogA` runs at nice 0 and completes quickly.
+`hogB` runs at nice 19 and takes significantly longer due to lower CPU priority under the CFS scheduler.
 
-### Logs
-sudo ./engine logs alpha  
-
----
-
-### Stop Container
-sudo ./engine stop alpha  
-sudo ./engine ps  
-
----
-
-## 5. Memory Limit Test
-sudo ./engine start memtest ./rootfs-alpha "/memory_hog 2 500" --soft-mib 40 --hard-mib 64  
-
-sleep 20  
-
-sudo dmesg | grep container_monitor | tail -20  
-
-Expected:
-- Soft limit → warning  
-- Hard limit → process killed  
+### Clean Teardown
+The supervisor shuts down cleanly with a clean exit message.
+No zombie or defunct processes remain after shutdown.
+The kernel module unloads cleanly with all entries freed.
 
 ---
 
-## 6. Scheduling Experiment
-time sudo ./engine run hogA ./rootfs-alpha "/cpu_hog 30"  
+## 4. Engineering Analysis
 
-time sudo ./engine run hogB ./rootfs-beta "/cpu_hog 30" --nice 19  
+### 1. Isolation Mechanisms
+The runtime achieves process isolation using Linux namespaces passed to `clone()`.
+`CLONE_NEWPID` creates a new PID namespace so the container process sees itself as PID 1 and cannot see host processes. `CLONE_NEWUTS` allows each container to have its own hostname set via `sethostname()`. `CLONE_NEWNS` isolates the mount namespace so `/proc` can be mounted privately inside the container without affecting the host. `chroot()` then restricts the filesystem view to the assigned rootfs directory, preventing the container from accessing host files.
 
-Observation:
-- hogA (nice 0) executes faster  
-- hogB (nice 19) executes slower  
+The host kernel is still shared across all containers. They use the same kernel system call interface, the same network stack (no `CLONE_NEWNET`), and the same CPU scheduler. The kernel mediates all resource access but containers are not fully isolated from each other at the network or IPC level.
 
----
+### 2. Supervisor and Process Lifecycle
+A long-running supervisor is necessary because Linux requires a parent process to call `wait()` on children to prevent zombie processes. Without a persistent parent, child processes become orphans adopted by init, losing the ability to track exit status and update metadata.
 
-## 7. Features
-- Multi-container execution  
-- Process isolation using namespaces  
-- Logging using pipes  
-- IPC using UNIX domain sockets  
-- Memory monitoring using kernel module  
-- Scheduling behavior using nice values  
+The supervisor installs a `SIGCHLD` handler that calls `waitpid(-1, WNOHANG)` in a loop to reap all exited children immediately. `SA_RESTART` ensures system calls interrupted by `SIGCHLD` are automatically restarted. Container metadata is protected by a mutex because both the `SIGCHLD` handler and the main event loop access it concurrently. The `stop_requested` flag distinguishes manual stops from hard-limit kills, allowing accurate state classification in `ps` output.
 
----
+### 3. IPC, Threads, and Synchronization
+Two separate IPC mechanisms are used as required.
 
-## 8. Concepts Explained
+**Path A (logging):** Each container's stdout and stderr are connected to the supervisor via a pipe created before `clone()`. The child inherits the write end and the supervisor reads from the read end in a producer thread. Pipes are chosen because they provide natural EOF signalling when the container exits, making cleanup straightforward.
 
-### Process Isolation
-Implemented using Linux namespaces:
-- CLONE_NEWPID → separate process IDs  
-- CLONE_NEWUTS → separate hostname  
-- CLONE_NEWNS → separate filesystem  
+**Path B (control):** CLI clients communicate with the supervisor via a UNIX domain socket at `/tmp/mini_runtime.sock`. UNIX sockets support bidirectional communication and multiple clients, making them suitable for request-response CLI interactions.
 
-chroot() restricts container access to its root filesystem.
+The bounded buffer uses a mutex plus two condition variables (`not_full` and `not_empty`). The mutex prevents simultaneous modification of `head`, `tail`, and `count` by multiple producer threads and the consumer thread. Condition variables allow producers to sleep efficiently when the buffer is full and the consumer to sleep when empty, avoiding busy-waiting. The `shutting_down` flag allows clean drain-and-exit behavior in the consumer thread.
 
----
+### 4. Memory Management and Enforcement
+RSS (Resident Set Size) measures the number of pages currently in physical RAM multiplied by page size. It does not include swapped-out pages, memory-mapped files not yet faulted in, or shared library pages.
 
-### Supervisor
-A persistent supervisor process manages all containers and prevents zombie processes using waitpid().
+Soft and hard limits implement different policies. The soft limit triggers a warning logged via `printk`, giving visibility without killing the process. The hard limit enforces a strict ceiling by sending `SIGKILL`.
+
+Enforcement belongs in kernel space because user-space cannot reliably measure or control another process's memory. The kernel has direct access to `mm_struct` and `get_mm_rss()`, and can send `SIGKILL` atomically without the target process being able to intercept or delay it.
+
+### 5. Scheduling Behavior
+Linux uses the Completely Fair Scheduler (CFS). Nice values map to scheduling weights: nice 0 maps to weight 1024 and nice 19 maps to weight 15. When two CPU-bound processes compete, CFS allocates CPU time proportional to weights.
+
+Our experiment ran `hogA` at nice 0 and `hogB` at nice 19 simultaneously. `hogA` completed almost instantly while `hogB` took 22 seconds, demonstrating CFS proportional-share fairness working as designed.
 
 ---
+
+## 5. Design Decisions and Tradeoffs
+
+### Namespace Isolation
+**Choice:** `CLONE_NEWPID` + `CLONE_NEWUTS` + `CLONE_NEWNS` with `chroot`.  
+**Tradeoff:** `chroot` is simpler than `pivot_root` but allows potential escape via path traversal if the container process has root privileges inside.  
+**Justification:** For a project runtime demonstrating isolation concepts, `chroot` provides sufficient isolation with much simpler implementation.
+
+### Supervisor Architecture
+**Choice:** Single-threaded event loop with non-blocking `accept()` checking `should_stop` every 10ms, combined with a `SIGCHLD` handler for child reaping.  
+**Tradeoff:** Cannot handle concurrent CLI requests simultaneously.  
+**Justification:** Container operations are fast and infrequent. Serial handling is correct and simple for a small number of containers.
 
 ### IPC and Logging
-- UNIX domain sockets → CLI communication  
-- Pipes → capture container output  
+**Choice:** UNIX domain socket for the control plane, pipes for logging, bounded buffer with mutex and condition variables.  
+**Tradeoff:** Pipes are unidirectional so a separate pipe is needed per container.  
+**Justification:** Pipe EOF signalling makes producer thread cleanup automatic and correct when containers exit.
+
+### Kernel Monitor
+**Choice:** Mutex over spinlock for protecting the monitored process list.  
+**Tradeoff:** Mutex cannot be held in hard IRQ context.  
+**Justification:** The timer callback runs in softirq context on modern kernels where sleeping is permitted, making mutex the correct and safer choice.
+
+### Scheduling Experiments
+**Choice:** Compare two `cpu_hog` containers at nice 0 vs nice 19.  
+**Tradeoff:** Results vary with host system load and are not perfectly reproducible.  
+**Justification:** Nice values provide a simple, controllable, measurable priority difference that directly demonstrates CFS weighted scheduling.
 
 ---
 
-### Memory Management
-Kernel module monitors RSS (Resident Set Size):
-- Soft limit → warning  
-- Hard limit → process termination  
+## 6. Scheduler Experiment Results
 
----
+| Container | Nice Value | Real Time  | Observation                          |
+|-----------|------------|------------|--------------------------------------|
+| hogA      | 0          | 0m0.055s   | Returned quickly, high CPU share     |
+| hogB      | 19         | 0m22.278s  | Took 22 seconds, low CPU share       |
 
-### Scheduling
-Linux uses Completely Fair Scheduler (CFS):
-- nice 0 → high priority  
-- nice 19 → low priority  
+Both containers ran `cpu_hog` simultaneously. `hogA` at nice 0 received the majority of available CPU time. `hogB` at nice 19 received significantly less CPU time from the Linux CFS scheduler, taking much longer to complete.
 
-CPU time is distributed accordingly.
-
----
-
-## 9. Conclusion
-This project successfully demonstrates core OS concepts through a working container runtime including process isolation, logging, memory enforcement, and scheduling behavior.
+This result matches Linux scheduling theory. CFS assigns weights based on nice values and distributes CPU time proportionally. Under contention, a nice 19 process receives approximately 1/68th the CPU share of a nice 0 process, resulting in dramatically slower throughput for CPU-bound workloads.
